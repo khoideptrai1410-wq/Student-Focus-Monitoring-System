@@ -1,0 +1,45 @@
+# ui/styles.py
+
+# ===== COLORS =====
+
+NAVY = "#0F172A"
+PRIMARY = "#2563EB"
+
+SUCCESS = "#22C55E"
+WARNING = "#F59E0B"
+DANGER = "#EF4444"
+
+BACKGROUND = "#F8FAFC"
+CARD = "#FFFFFF"
+
+TEXT = "#111827"
+TEXT_LIGHT = "#6B7280"
+
+BORDER = "#D1D5DB"
+
+# ===== FONTS =====
+
+TITLE_FONT = ("Segoe UI", 24, "bold")
+SUBTITLE_FONT = ("Segoe UI", 16)
+
+HEADER_FONT = ("Segoe UI", 14, "bold")
+BODY_FONT = ("Segoe UI", 11)
+
+BUTTON_FONT = ("Segoe UI", 11, "bold")
+
+# ===== WINDOW =====
+
+WINDOW_WIDTH = 1400
+WINDOW_HEIGHT = 900
+
+# ===== CAMERA =====
+
+CAMERA_WIDTH = 320
+CAMERA_HEIGHT = 240
+
+# ===== WARNING COLORS =====
+
+WARNING_1_BG = "#FBBF24"
+WARNING_2_BG = "#EF4444"
+
+LOCK_BG = "#7F1D1D"
