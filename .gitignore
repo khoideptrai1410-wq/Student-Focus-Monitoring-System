@@ -236,3 +236,6 @@ data/phone_classifier/processed/
 evaluation/feature_log.csv
 evaluation/prediction.csv
 reports/*.csv
+
+!data/phone_classifier/raw/PHONE/.gitkeep
+!data/phone_classifier/raw/NOT_PHONE/.gitkeep
