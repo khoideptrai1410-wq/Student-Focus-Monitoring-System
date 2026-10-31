@@ -78,15 +78,16 @@ class SystemMonitorApp:
         self.yolo_error = None
 
         # Configuration
-        self.YOLO_EVERY_N_FRAMES = 6
-        self.YOLO_IMAGE_SIZE = 320
+        self.YOLO_EVERY_N_FRAMES = 3
+        self.YOLO_IMAGE_SIZE = 416
         self.VISION_EVERY_N_FRAMES = 4
 
         #Nguong chung cho yolo va phat hien nguoi
         self.YOLO_CONFIDENCE = 0.25
 
         # Confidence rieng cho dien thoai
-        self.PHONE_CONFIDENCE = 0.40
+        self.PHONE_CONFIDENCE = 0.25
+        self.PHONE_CLASSIFIER_THRESHOLD = 0.50
 
         # Modules
         self.face_detector = None
@@ -218,8 +219,10 @@ class SystemMonitorApp:
 
         self.phone_detector = PhoneDetector(
             model=self.yolo_model,
-            confidence=self.PHONE_CONFIDENCE
+            confidence=self.PHONE_CONFIDENCE,
+            classifier_threshold=self.PHONE_CLASSIFIER_THRESHOLD,
         )
+        self.phone_detector.load_classifier()
 
         self.logger.info("Shared YOLOv8 model loaded.")
 

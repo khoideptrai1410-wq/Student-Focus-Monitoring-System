@@ -39,13 +39,36 @@ Hệ thống hiện hỗ trợ các chức năng sau:
 - Phát hiện khuôn mặt (Face Detection)
 - Theo dõi hướng nhìn của mắt (Eye Gaze Tracking)
 - Ước lượng tư thế đầu (Head Pose Estimation)
-- Phát hiện điện thoại bằng YOLOv8
+- Đề xuất vật thể bằng YOLOv8 và xác minh điện thoại bằng CNN
 - Phát hiện người
 - Phân tích trạng thái tập trung
 - Tính điểm tập trung
 - Ghi nhận vi phạm
 - Xuất báo cáo CSV
 - Giao diện Dashboard theo thời gian thực
+
+---
+
+# Giảm nhận diện nhầm điện thoại
+
+YOLO chỉ đề xuất vùng vật thể; ứng viên chỉ được báo là điện thoại khi CNN
+đã được huấn luyện và xác nhận. Nếu chưa có
+`models/phone_classifier.pth`, hệ thống sẽ bỏ qua ứng viên thay vì dùng YOLO
+một mình (tránh nhận nhầm chuột, chai nước, thẻ xe, v.v.).
+
+Trong cấu hình hiện tại, YOLO kiểm tra mỗi 3 frame ở kích thước 416 để tăng
+cơ hội bắt được điện thoại nhỏ trên tay; CNN xác nhận từ xác suất 0.50. Cấu
+hình này tăng độ nhạy nhưng có thể làm CPU bận hơn.
+
+Để bật xác minh:
+
+1. Chạy `python training/collect_phone_candidates.py`.
+2. Khi vật thể được khoanh, nhấn `P` nếu đó là điện thoại hoặc `N` nếu không
+   phải điện thoại. Thu thập nhiều góc nhìn, khoảng cách và điều kiện ánh sáng;
+   đặc biệt thêm các vật thể thường bị nhận nhầm vào lớp `NOT_PHONE`.
+3. Thu thập đủ ảnh cho cả hai lớp, sau đó chạy
+   `python training/train_phone_classifier.py`.
+4. Khởi động lại ứng dụng để nạp checkpoint vừa huấn luyện.
 
 ---
 

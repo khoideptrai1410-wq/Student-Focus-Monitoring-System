@@ -12,7 +12,7 @@ class PhoneClassifier:
     def __init__(
         self,
         model_path: Optional[str] = None,
-        threshold: float = 0.80,
+        threshold: float = 0.50,
         device: Optional[str] = None,
     ) -> None:
         project_root = Path(__file__).resolve().parent.parent
@@ -47,9 +47,8 @@ class PhoneClassifier:
         if not self.model_path.is_file():
             self._load_error = f"Checkpoint not found: {self.model_path}"
             print(
-                "[WARNING] Phone CNN is not trained yet. "
-                "YOLO phone candidates will NOT be treated as confirmed phones. "
-                f"Expected file: {self.model_path}"
+                "[WARNING] Phone detection is disabled until a trained CNN "
+                f"checkpoint is available: {self.model_path}"
             )
             return False
 

@@ -8,16 +8,15 @@ class PhoneDetector:
     """Detect phone candidates with YOLOv8 and verify them with MobileNetV3.
 
     YOLO class 67 (COCO: cell phone) proposes candidate bounding boxes.
-    If a trained PhoneClassifier checkpoint is available, each candidate crop
-    is verified by the CNN. If the checkpoint is not available yet, this class
-    falls back to YOLO detections so the existing phone-detection feature keeps
-    working while the training dataset is being collected.
+    Each candidate crop must be verified by a trained PhoneClassifier. If the
+    classifier is unavailable, candidates are rejected rather than treated as
+    confirmed phones.
 
     Detection tuple format:
         (x1, y1, x2, y2, confidence)
 
-    confidence is YOLO confidence during fallback, and CNN phone probability
-    after successful CNN verification.
+    Candidate tuples contain YOLO confidence; confirmed tuples contain CNN
+    phone probability.
     """
 
     PHONE_CLASS_ID = 67
@@ -28,7 +27,7 @@ class PhoneDetector:
         confidence: float = 0.25,
         model=None,
         classifier_path: Optional[str] = None,
-        classifier_threshold: float = 0.80,
+        classifier_threshold: float = 0.50,
         classifier=None,
         use_classifier_if_available: bool = True,
     ) -> None:
@@ -83,7 +82,7 @@ class PhoneDetector:
         print("[INFO] YOLO Phone Detector Loaded")
 
     def load_classifier(self) -> bool:
-        """Thử tải CNN. Nếu chưa có trọng số thì dùng YOLO."""
+        """Thử tải CNN để xác minh ứng viên YOLO."""
 
         if not self.use_classifier_if_available:
             return False
@@ -94,11 +93,7 @@ class PhoneDetector:
             )
 
         except Exception as error:
-            print(
-                "[WARNING] Không tải được Phone CNN; "
-                "tạm dùng kết quả YOLO. "
-                f"Chi tiết: {error}"
-            )
+            print(f"[WARNING] Không tải được Phone CNN: {error}")
 
             return False
 
@@ -209,14 +204,7 @@ class PhoneDetector:
         return crop.copy()
 
     def detect_phone(self, frame, results=None):
-        """YOLO phát hiện và CNN xác minh điện thoại.
-
-        Khi chưa có CNN:
-            Trả về các ứng viên YOLO để chức năng không bị tắt.
-
-        Khi đã có CNN:
-            Chỉ trả về ứng viên được CNN xác nhận là PHONE.
-        """
+        """Only return YOLO candidates confirmed by the trained phone CNN."""
 
         if frame is None or getattr(frame, "size", 0) == 0:
             return []
@@ -242,26 +230,20 @@ class PhoneDetector:
         if not candidates:
             return []
 
-        # Bước 2: Nếu CNN chưa sẵn sàng,
-        # tạm thời sử dụng YOLO như trước.
+        # A YOLO proposal alone is not reliable enough to report a phone.
         if not self.load_classifier():
 
             if not self._fallback_warning_shown:
 
                 print(
-                    "[INFO] Phone CNN chưa sẵn sàng; "
-                    "đang tạm dùng YOLOv8 để nhận diện điện thoại."
-                )
-
-                print(
-                    "[INFO] Hãy huấn luyện và đặt file "
-                    "models/phone_classifier.pth "
-                    "để bật xác minh CNN."
+                    "[WARNING] Phone CNN unavailable; ignoring YOLO "
+                    "candidates to avoid false positives. Train "
+                    "models/phone_classifier.pth to enable verification."
                 )
 
                 self._fallback_warning_shown = True
 
-            return candidates
+            return []
 
         # Bước 3: CNN xác minh từng ứng viên.
         confirmed = []
