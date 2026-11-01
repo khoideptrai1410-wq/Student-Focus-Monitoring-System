@@ -70,6 +70,10 @@ hình này tăng độ nhạy nhưng có thể làm CPU bận hơn.
    `python training/train_phone_classifier.py`.
 4. Khởi động lại ứng dụng để nạp checkpoint vừa huấn luyện.
 
+Sơ đồ quy trình, hướng dẫn kiểm tra nhãn, đánh giá trên buổi quay riêng và
+các lệnh PowerShell được ghi tại
+[training/PHONE_CLASSIFIER_GUIDE.md](training/PHONE_CLASSIFIER_GUIDE.md).
+
 ---
 
 # Quy trình nhận dạng mẫu

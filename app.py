@@ -86,7 +86,8 @@ class SystemMonitorApp:
         self.YOLO_CONFIDENCE = 0.25
 
         # Confidence rieng cho dien thoai
-        self.PHONE_CONFIDENCE = 0.25
+        self.PHONE_CONFIDENCE = 0.10
+        self.YOLO_PREDICT_CONFIDENCE = 0.10
         self.PHONE_CLASSIFIER_THRESHOLD = 0.50
 
         # Modules
@@ -327,7 +328,7 @@ class SystemMonitorApp:
                 results = self.yolo_model.predict(
                     source=frame,
                     classes=[0, 67],
-                    conf=self.YOLO_CONFIDENCE,
+                    conf=self.YOLO_PREDICT_CONFIDENCE,
                     imgsz=self.YOLO_IMAGE_SIZE,
                     device="cpu",
                     verbose=False
