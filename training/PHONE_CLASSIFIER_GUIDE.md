@@ -61,6 +61,12 @@ Trong cửa sổ camera:
 - Nhấn `N` khi vùng đang khoanh không phải điện thoại.
 - Nhấn `S` để chọn ứng viên tiếp theo nếu có nhiều vùng.
 - Nhấn `Q` để kết thúc.
+- Bộ thu thập tự bỏ qua ảnh gần trùng với ảnh đã lưu trong cùng lớp. Mặc định,
+  khác biệt dưới 6 bit perceptual hash được xem là gần trùng; dùng
+  `--min-hash-distance 0` để tắt bộ lọc.
+- Mặc định mỗi lớp lưu tối đa 100 ảnh; crop được thu nhỏ tối đa 512 pixel cạnh
+  dài và lưu JPEG chất lượng 85 để giảm dung lượng. Có thể thay đổi bằng
+  `--max-images-per-class`, `--max-crop-size` và `--jpeg-quality`.
 
 Thử cầm điện thoại trên tay nhiều lần, thay đổi góc, khoảng cách, ánh sáng và
 nền. Lớp `NOT_PHONE` nên có chuột, chai nước, thẻ xe và các vật thường bị nhầm.
@@ -77,6 +83,8 @@ Trước khi huấn luyện, mở và kiểm tra ảnh trong hai thư mục này
 chuyển ảnh gán nhãn sai và ảnh trùng lặp; cố gắng giữ số lượng và độ đa dạng
 tương đối cân bằng giữa hai lớp. Mỗi lớp cần ít nhất 5 ảnh để script chạy,
 nhưng đây chỉ là mức tối thiểu, không phải bộ dữ liệu đủ tốt.
+Bộ lọc trùng giúp giảm ảnh dư thừa và dung lượng mới phát sinh; vẫn nên chủ
+động đổi góc, khoảng cách, ánh sáng, nền và vật thể để thu được ảnh đa dạng.
 
 Hiện bộ dữ liệu của dự án có hơn 63 ảnh `PHONE` và hơn 60 ảnh `NOT_PHONE`.
 Số lượng gần cân bằng nhưng chưa chứng minh độ chính xác cao: cần ưu tiên ảnh
@@ -89,10 +97,15 @@ khác nhau. Tránh chỉ chụp liên tiếp cùng một cảnh vì ảnh gần 
 .\.venv\Scripts\python.exe training\train_phone_classifier.py
 ```
 
-Mặc định script dùng MobileNetV3 pretrained, 15 epoch, batch size 16; tự chọn
+Mặc định script dùng MobileNetV3 pretrained, 20 epoch, batch size 16; tự chọn
 CUDA nếu PyTorch nhận GPU, nếu không thì chạy CPU. Đây là thiết lập cân bằng tốc
 độ và chất lượng, không có thiết lập nào bảo đảm chính xác nhất cho mọi camera.
 Đừng thêm `--no-pretrained` trừ khi không thể tải trọng số pretrained.
+
+Script hiện dùng tối đa 100 ảnh mỗi lớp từ `raw` (chọn ngẫu nhiên có seed cố
+định), nhưng vẫn giữ nguyên ảnh gốc và toàn bộ `holdout_val`. Dùng
+`--max-images-per-class 0` để huấn luyện trên toàn bộ ảnh train; dùng
+`--batch-size 8` nếu cần giảm thêm bộ nhớ RAM/GPU.
 
 Script in accuracy train/validation theo từng epoch và lưu checkpoint tốt nhất
 vào `models\phone_classifier.pth`. Chờ thông báo `Training finished` trước khi
