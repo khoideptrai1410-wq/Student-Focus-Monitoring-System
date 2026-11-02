@@ -89,7 +89,22 @@ class PhoneClassifier:
 
             model = models.mobilenet_v3_small(weights=None)
             input_features = model.classifier[3].in_features
-            model.classifier[3] = nn.Linear(input_features, len(self.class_names))
+
+            # Hỗ trợ cả hai dạng classifier head:
+            # - V2 cũ: nn.Linear đơn giản
+            # - V3 mới: nn.Sequential(Dropout, Linear) để giảm overfitting
+            state_keys = checkpoint["state_dict"].keys()
+            has_sequential_head = any(
+                "classifier.3.1.weight" in k for k in state_keys
+            )
+            if has_sequential_head:
+                model.classifier[3] = nn.Sequential(
+                    nn.Dropout(p=0.30),
+                    nn.Linear(input_features, len(self.class_names))
+                )
+            else:
+                model.classifier[3] = nn.Linear(input_features, len(self.class_names))
+
             model.load_state_dict(checkpoint["state_dict"])
             model.to(self.device)
             model.eval()

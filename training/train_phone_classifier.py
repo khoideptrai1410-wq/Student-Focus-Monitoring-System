@@ -1,4 +1,4 @@
-
+# -*- coding: utf-8 -*-
 """
 Train MobileNetV3-Small to classify PHONE vs NOT_PHONE.
 
@@ -19,6 +19,17 @@ Important:
 - holdout_val is used only for validation.
 - holdout_test is never loaded by this script.
 - Output is saved as models/phone_classifier_v2.pth.
+
+Cải tiến v3 (giảm false positive chuột/chai nước/bóp):
+- Augmentation mạnh hơn: RandomPerspective, GaussianBlur, RandomGrayscale,
+  RandomErasing để buộc model học đặc trưng cấu trúc thay vì màu sắc.
+- Label Smoothing để tránh model quá tự tin với NOT_PHONE.
+- Mixup augmentation trộn lẫn ảnh PHONE và NOT_PHONE, buộc ranh giới quyết định
+  sắc nét hơn.
+- Precision-oriented checkpoint: ưu tiên model có FP thấp (ít báo nhầm nhất).
+- Tùy chọn --high-precision-mode tăng ngưỡng lựa chọn checkpoint lên 0.70.
+- Tùy chọn --freeze-backbone để fine-tune chỉ classifier head (nhanh hơn).
+- Tùy chọn --hard-negative-weight để phạt nặng false positive hơn.
 """
 
 import argparse
@@ -29,6 +40,7 @@ from copy import deepcopy
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from torch.utils.data import DataLoader, Subset
 from torchvision import datasets, models, transforms
@@ -68,7 +80,7 @@ THRESHOLDS_TO_REPORT = [
 def parse_args():
 
     parser = argparse.ArgumentParser(
-        description="Train Phone Classifier V2"
+        description="Train Phone Classifier V2 (cải tiến giảm false positive)"
     )
 
     parser.add_argument(
@@ -89,7 +101,8 @@ def parse_args():
     parser.add_argument(
         "--epochs",
         type=int,
-        default=20
+        default=30,
+        help="Số epoch (mặc định tăng lên 30 để hội tụ tốt hơn)"
     )
 
     parser.add_argument(
@@ -101,14 +114,15 @@ def parse_args():
     parser.add_argument(
         "--max-images-per-class",
         type=int,
-        default=100,
-        help="Use at most this many randomly selected training images per class; 0 uses all",
+        default=0,
+        help="Dùng tối đa n ảnh mỗi lớp; 0 = dùng tất cả (mặc định đổi sang 0)",
     )
 
     parser.add_argument(
         "--learning-rate",
         type=float,
-        default=0.0001
+        default=0.0003,
+        help="Learning rate ban đầu (mặc định tăng nhẹ để warm-up nhanh hơn)"
     )
 
     parser.add_argument(
@@ -127,6 +141,60 @@ def parse_args():
         "--no-pretrained",
         action="store_true",
         help="Train without ImageNet pretrained weights"
+    )
+
+    parser.add_argument(
+        "--freeze-backbone",
+        action="store_true",
+        help=(
+            "Đóng băng backbone MobileNetV3, chỉ train classifier head. "
+            "Nhanh hơn và ít overfitting khi dữ liệu ít (<200 ảnh/lớp)."
+        )
+    )
+
+    parser.add_argument(
+        "--label-smoothing",
+        type=float,
+        default=0.10,
+        help="Label smoothing (0.0 = tắt; 0.10 giúp tránh overconfidence)"
+    )
+
+    parser.add_argument(
+        "--mixup-alpha",
+        type=float,
+        default=0.20,
+        help="Mixup alpha (0.0 = tắt mixup; 0.20 trộn nhẹ để tạo ranh giới rõ ràng hơn)"
+    )
+
+    parser.add_argument(
+        "--hard-negative-weight",
+        type=float,
+        default=2.0,
+        help=(
+            "Nhân trọng số lớp NOT_PHONE thêm n lần so với cân bằng tự nhiên. "
+            "Giá trị > 1 phạt nặng false positive (báo nhầm vật khác là điện thoại). "
+            "Ví dụ: 2.0 = NOT_PHONE được coi là quan trọng gấp đôi PHONE."
+        )
+    )
+
+    parser.add_argument(
+        "--high-precision-mode",
+        action="store_true",
+        help=(
+            "Chọn checkpoint tối ưu Precision thay vì F1. "
+            "Dùng khi cần tuyệt đối không báo nhầm (chuột/chai nước/bóp), "
+            "chấp nhận bỏ sót điện thoại hơn."
+        )
+    )
+
+    parser.add_argument(
+        "--selection-threshold",
+        type=float,
+        default=SELECTION_THRESHOLD,
+        help=(
+            "Ngưỡng xác suất để chọn checkpoint tốt nhất. "
+            "Nâng lên 0.65-0.70 để giảm false positive trong validation."
+        )
     )
 
     return parser.parse_args()
@@ -148,36 +216,87 @@ def set_seed(seed):
 
 
 # ==========================================================
-# DATA TRANSFORMS
+# DATA TRANSFORMS (cải tiến)
 # ==========================================================
 
-def create_transforms():
+def create_transforms(use_strong_augment: bool = True):
+    """
+    Augmentation mạnh hơn để giảm false positive:
+    - RandomPerspective: giả lập góc nhìn khác nhau (cầm điện thoại nghiêng).
+    - GaussianBlur: giả lập camera mờ/nhoè.
+    - RandomGrayscale: buộc model học hình dạng, không chỉ màu sắc.
+    - RandomErasing: che ngẫu nhiên một phần ảnh, tránh overfit màu nền.
+    """
 
-    train_transform = transforms.Compose([
+    if use_strong_augment:
+        train_transform = transforms.Compose([
 
-        transforms.RandomResizedCrop(
-            INPUT_SIZE,
-            scale=(0.85, 1.0),
-            ratio=(0.90, 1.10)
-        ),
+            transforms.RandomResizedCrop(
+                INPUT_SIZE,
+                scale=(0.70, 1.0),   # crop rộng hơn để học nhiều tỷ lệ
+                ratio=(0.75, 1.33)   # tỷ lệ khung hình đa dạng hơn
+            ),
 
-        transforms.RandomHorizontalFlip(
-            p=0.5
-        ),
+            transforms.RandomHorizontalFlip(p=0.5),
 
-        transforms.ColorJitter(
-            brightness=0.15,
-            contrast=0.15,
-            saturation=0.10
-        ),
+            transforms.RandomVerticalFlip(p=0.10),  # ảnh điện thoại ít lộn ngược
 
-        transforms.ToTensor(),
+            transforms.RandomRotation(degrees=15),   # xoay nhẹ
 
-        transforms.Normalize(
-            mean=MEAN,
-            std=STD
-        )
-    ])
+            transforms.RandomPerspective(
+                distortion_scale=0.20,
+                p=0.40
+            ),
+
+            transforms.ColorJitter(
+                brightness=0.30,
+                contrast=0.30,
+                saturation=0.20,
+                hue=0.05
+            ),
+
+            transforms.RandomGrayscale(p=0.10),  # học hình dạng, không chỉ màu
+
+            transforms.GaussianBlur(
+                kernel_size=3,
+                sigma=(0.1, 1.5)
+            ),
+
+            transforms.ToTensor(),
+
+            transforms.Normalize(mean=MEAN, std=STD),
+
+            # Che ngẫu nhiên một vùng nhỏ, tránh overfit chi tiết cục bộ
+            transforms.RandomErasing(
+                p=0.20,
+                scale=(0.02, 0.10),
+                ratio=(0.5, 2.0),
+                value=0
+            ),
+        ])
+
+    else:
+        # Augmentation nhẹ (tương thích với phiên bản cũ)
+        train_transform = transforms.Compose([
+
+            transforms.RandomResizedCrop(
+                INPUT_SIZE,
+                scale=(0.85, 1.0),
+                ratio=(0.90, 1.10)
+            ),
+
+            transforms.RandomHorizontalFlip(p=0.5),
+
+            transforms.ColorJitter(
+                brightness=0.15,
+                contrast=0.15,
+                saturation=0.10
+            ),
+
+            transforms.ToTensor(),
+
+            transforms.Normalize(mean=MEAN, std=STD),
+        ])
 
     val_transform = transforms.Compose([
 
@@ -194,6 +313,52 @@ def create_transforms():
     ])
 
     return train_transform, val_transform
+
+
+# ==========================================================
+# MIXUP AUGMENTATION
+# ==========================================================
+
+def mixup_batch(images, labels, alpha: float, num_classes: int, device):
+    """
+    Mixup: trộn cặp ảnh và nhãn ngẫu nhiên.
+    Giúp model học ranh giới quyết định sắc nét hơn giữa PHONE và NOT_PHONE.
+    Trả về (mixed_images, soft_labels) với soft_labels là one-hot mềm.
+    """
+    if alpha <= 0.0:
+        # Không dùng mixup; trả về one-hot cứng
+        soft_labels = F.one_hot(labels, num_classes).float()
+        return images, soft_labels
+
+    lam = np.random.beta(alpha, alpha)
+    batch_size = images.size(0)
+    perm = torch.randperm(batch_size, device=device)
+
+    mixed_images = lam * images + (1 - lam) * images[perm]
+
+    # Tạo soft label
+    labels_one_hot = F.one_hot(labels, num_classes).float()
+    labels_perm_one_hot = F.one_hot(labels[perm], num_classes).float()
+    soft_labels = lam * labels_one_hot + (1 - lam) * labels_perm_one_hot
+
+    return mixed_images, soft_labels
+
+
+def soft_cross_entropy(logits, soft_labels, label_smoothing: float = 0.0):
+    """
+    Cross entropy với soft label (dùng cho mixup + label smoothing).
+    """
+    num_classes = logits.size(1)
+
+    if label_smoothing > 0.0:
+        # Áp dụng label smoothing lên soft label
+        smoothed = soft_labels * (1 - label_smoothing) + label_smoothing / num_classes
+    else:
+        smoothed = soft_labels
+
+    log_probs = F.log_softmax(logits, dim=1)
+    loss = -(smoothed * log_probs).sum(dim=1).mean()
+    return loss
 
 
 # ==========================================================
@@ -215,7 +380,7 @@ def load_datasets(train_dir, val_dir):
             f"Không tìm thấy thư mục validation: {val_path.resolve()}"
         )
 
-    train_transform, val_transform = create_transforms()
+    train_transform, val_transform = create_transforms(use_strong_augment=True)
 
     train_dataset = datasets.ImageFolder(
         str(train_path),
@@ -331,7 +496,13 @@ def limit_training_images(dataset, class_names, max_per_class, seed):
 # MODEL
 # ==========================================================
 
-def build_model(num_classes, pretrained=True):
+def build_model(num_classes, pretrained=True, freeze_backbone=False):
+    """
+    Xây dựng MobileNetV3-Small với tùy chọn đóng băng backbone.
+
+    freeze_backbone=True: chỉ train classifier head.
+    Phù hợp khi dữ liệu ít (<200 ảnh/lớp) để tránh overfitting.
+    """
 
     if pretrained:
 
@@ -347,26 +518,35 @@ def build_model(num_classes, pretrained=True):
             weights=None
         )
 
+    if freeze_backbone and pretrained:
+        # Đóng băng toàn bộ features, chỉ train avgpool + classifier
+        for param in model.features.parameters():
+            param.requires_grad = False
+        print("[INFO] Backbone đã bị đóng băng. Chỉ train classifier head.")
+
     input_features = model.classifier[3].in_features
 
-    model.classifier[3] = nn.Linear(
-        input_features,
-        num_classes
+    # Thêm Dropout cao hơn vào classifier để tránh overfitting
+    model.classifier[3] = nn.Sequential(
+        nn.Dropout(p=0.30),
+        nn.Linear(input_features, num_classes)
     )
 
     return model
 
 
 # ==========================================================
-# TRAIN ONE EPOCH
+# TRAIN ONE EPOCH (hỗ trợ mixup)
 # ==========================================================
 
 def train_one_epoch(
     model,
     loader,
-    criterion,
     optimizer,
-    device
+    device,
+    num_classes: int,
+    mixup_alpha: float = 0.0,
+    label_smoothing: float = 0.0
 ):
 
     model.train()
@@ -380,20 +560,28 @@ def train_one_epoch(
         images = images.to(device)
         labels = labels.to(device)
 
+        # Áp dụng mixup
+        mixed_images, soft_labels = mixup_batch(
+            images, labels, mixup_alpha, num_classes, device
+        )
+
         optimizer.zero_grad(set_to_none=True)
 
-        outputs = model(images)
+        logits = model(mixed_images)
 
-        loss = criterion(
-            outputs,
-            labels
-        )
+        loss = soft_cross_entropy(logits, soft_labels, label_smoothing)
 
         loss.backward()
 
+        # Gradient clipping để training ổn định hơn
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
         optimizer.step()
 
-        predictions = outputs.argmax(dim=1)
+        # Tính accuracy trên ảnh gốc (không mixup) cho dễ theo dõi
+        with torch.inference_mode():
+            orig_logits = model(images)
+            predictions = orig_logits.argmax(dim=1)
 
         batch_size = labels.size(0)
 
@@ -419,7 +607,6 @@ def train_one_epoch(
 def validate(
     model,
     loader,
-    criterion,
     device,
     phone_index
 ):
@@ -432,6 +619,8 @@ def validate(
     true_labels = []
     phone_probabilities = []
 
+    criterion_eval = nn.CrossEntropyLoss()
+
     with torch.inference_mode():
 
         for images, labels in loader:
@@ -441,10 +630,7 @@ def validate(
 
             outputs = model(images)
 
-            loss = criterion(
-                outputs,
-                labels
-            )
+            loss = criterion_eval(outputs, labels)
 
             probabilities = torch.softmax(
                 outputs,
@@ -548,14 +734,16 @@ def calculate_metrics(
 
 def print_metrics(metrics, threshold):
 
+    fp_warn = " ⚠ FP CAO" if metrics["fp"] > 5 else ""
+
     print(
         f"Threshold={threshold:.2f} | "
-        f"Accuracy={metrics['accuracy'] * 100:.2f}% | "
-        f"Precision={metrics['precision'] * 100:.2f}% | "
-        f"Recall={metrics['recall'] * 100:.2f}% | "
-        f"F1={metrics['f1'] * 100:.2f}% | "
+        f"Acc={metrics['accuracy'] * 100:.1f}% | "
+        f"Precision={metrics['precision'] * 100:.1f}% | "
+        f"Recall={metrics['recall'] * 100:.1f}% | "
+        f"F1={metrics['f1'] * 100:.1f}% | "
         f"TP={metrics['tp']} "
-        f"FP={metrics['fp']} "
+        f"FP={metrics['fp']}{fp_warn} "
         f"TN={metrics['tn']} "
         f"FN={metrics['fn']}"
     )
@@ -566,6 +754,18 @@ def print_metrics(metrics, threshold):
 # ==========================================================
 
 def main():
+    import sys
+    import io
+    # Đảm bảo stdout có thể in UTF-8 trên Windows (PowerShell CP1252)
+    if hasattr(sys.stdout, "reconfigure"):
+        try:
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+    else:
+        sys.stdout = io.TextIOWrapper(
+            sys.stdout.buffer, encoding="utf-8", errors="replace"
+        )
 
     args = parse_args()
 
@@ -581,11 +781,22 @@ def main():
     if args.learning_rate <= 0:
         raise ValueError("Learning rate phải lớn hơn 0.")
 
+    if not 0.0 <= args.label_smoothing < 1.0:
+        raise ValueError("Label smoothing phải trong khoảng [0, 1).")
+
+    if args.mixup_alpha < 0.0:
+        raise ValueError("Mixup alpha không được âm.")
+
+    if args.hard_negative_weight < 1.0:
+        raise ValueError("hard-negative-weight phải >= 1.0.")
+
+    selection_threshold = args.selection_threshold
+
     set_seed(args.seed)
 
-    print("=" * 65)
-    print("       STUDENT FOCUS - PHONE CLASSIFIER V2")
-    print("=" * 65)
+    print("=" * 70)
+    print("    STUDENT FOCUS - PHONE CLASSIFIER V2 (cải tiến giảm FP)")
+    print("=" * 70)
 
     # ------------------------------------------------------
     # Load train and validation only.
@@ -639,6 +850,10 @@ def main():
         PHONE_LABEL
     )
 
+    not_phone_index = class_names.index(
+        NOT_PHONE_LABEL
+    )
+
     # ------------------------------------------------------
     # Device
     # ------------------------------------------------------
@@ -648,6 +863,20 @@ def main():
     )
 
     print("\nDevice:", device)
+
+    # ------------------------------------------------------
+    # Cấu hình training
+    # ------------------------------------------------------
+
+    print("\nTRAINING CONFIGURATION")
+    print(f"  Epochs             : {args.epochs}")
+    print(f"  Learning rate      : {args.learning_rate}")
+    print(f"  Label smoothing    : {args.label_smoothing}")
+    print(f"  Mixup alpha        : {args.mixup_alpha}")
+    print(f"  Hard negative wt   : {args.hard_negative_weight}x")
+    print(f"  Freeze backbone    : {args.freeze_backbone}")
+    print(f"  High precision mode: {args.high_precision_mode}")
+    print(f"  Selection threshold: {selection_threshold:.2f}")
 
     # ------------------------------------------------------
     # DataLoaders
@@ -679,7 +908,8 @@ def main():
 
         model = build_model(
             num_classes=len(class_names),
-            pretrained=not args.no_pretrained
+            pretrained=not args.no_pretrained,
+            freeze_backbone=args.freeze_backbone
         )
 
     except Exception as error:
@@ -692,7 +922,7 @@ def main():
     model.to(device)
 
     # ------------------------------------------------------
-    # Weighted loss
+    # Weighted loss - phạt nặng NOT_PHONE hơn để giảm FP
     # ------------------------------------------------------
 
     counts = [
@@ -705,6 +935,7 @@ def main():
         dtype=torch.float32
     )
 
+    # Cân bằng tự nhiên
     class_weights = (
         class_counts.sum()
         / (
@@ -713,19 +944,51 @@ def main():
         )
     )
 
-    criterion = nn.CrossEntropyLoss(
-        weight=class_weights.to(device)
-    )
+    # Phạt nặng thêm NOT_PHONE: tăng chi phí khi model báo nhầm vật khác là điện thoại
+    if args.hard_negative_weight > 1.0:
+        class_weights[not_phone_index] *= args.hard_negative_weight
+        print(
+            f"\n[INFO] NOT_PHONE weight nhân thêm {args.hard_negative_weight}x "
+            f"-> FP (báo nhầm vật khác) sẽ bị phạt nặng hơn."
+        )
 
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=args.learning_rate,
-        weight_decay=0.0001
+    # Criterion cho các batch không dùng mixup (val/eval)
+    criterion_train_plain = nn.CrossEntropyLoss(
+        weight=class_weights.to(device),
+        label_smoothing=args.label_smoothing
     )
+    _ = criterion_train_plain  # chỉ dùng để khởi tạo; mixup dùng soft_cross_entropy
 
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+    # Optimizer: tách learning rate cho backbone và head khi không freeze
+    if args.freeze_backbone:
+        optimizer = torch.optim.AdamW(
+            filter(lambda p: p.requires_grad, model.parameters()),
+            lr=args.learning_rate,
+            weight_decay=0.01
+        )
+    else:
+        # Backbone học chậm hơn 10x để không phá vỡ pretrained features
+        backbone_params = list(model.features.parameters())
+        head_params = list(model.classifier.parameters())
+
+        optimizer = torch.optim.AdamW(
+            [
+                {"params": backbone_params, "lr": args.learning_rate * 0.1},
+                {"params": head_params,    "lr": args.learning_rate}
+            ],
+            weight_decay=0.01
+        )
+        print(
+            f"[INFO] Differential LR: backbone={args.learning_rate * 0.1:.6f}, "
+            f"head={args.learning_rate:.6f}"
+        )
+
+    # Cosine Annealing với warm restart
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
         optimizer,
-        T_max=args.epochs
+        T_0=10,           # restart mỗi 10 epoch
+        T_mult=1,
+        eta_min=1e-6
     )
 
     # ------------------------------------------------------
@@ -739,8 +1002,10 @@ def main():
         exist_ok=True
     )
 
+    best_score = -1.0      # F1 hoặc Precision tùy mode
     best_f1 = -1.0
     best_precision = -1.0
+    best_fp = float("inf")
     best_checkpoint = None
 
     # ------------------------------------------------------
@@ -748,22 +1013,23 @@ def main():
     # ------------------------------------------------------
 
     print("\nSTART TRAINING")
-    print("-" * 65)
+    print("-" * 70)
 
     for epoch in range(1, args.epochs + 1):
 
         train_loss, train_accuracy = train_one_epoch(
             model,
             train_loader,
-            criterion,
             optimizer,
-            device
+            device,
+            num_classes=len(class_names),
+            mixup_alpha=args.mixup_alpha,
+            label_smoothing=args.label_smoothing
         )
 
         val_loss, true_labels, phone_probs = validate(
             model,
             val_loader,
-            criterion,
             device,
             phone_index
         )
@@ -774,33 +1040,53 @@ def main():
             true_labels,
             phone_probs,
             phone_index,
-            SELECTION_THRESHOLD
+            selection_threshold
         )
+
+        fp_indicator = f" [FP={metrics['fp']}]" if metrics['fp'] > 0 else " [FP=0 ✓]"
 
         print(
             f"Epoch {epoch:02d}/{args.epochs} | "
-            f"Train Loss={train_loss:.4f} | "
-            f"Train Acc={train_accuracy * 100:.2f}% | "
-            f"Val Loss={val_loss:.4f} | "
-            f"Val F1 PHONE={metrics['f1'] * 100:.2f}%"
+            f"TrainLoss={train_loss:.4f} | "
+            f"TrainAcc={train_accuracy * 100:.1f}% | "
+            f"ValLoss={val_loss:.4f} | "
+            f"F1={metrics['f1'] * 100:.1f}% | "
+            f"Prec={metrics['precision'] * 100:.1f}%{fp_indicator}"
         )
 
-        # Select checkpoint by PHONE F1.
-        # If F1 is equal, prefer higher PHONE precision.
+        # --------------------------------------------------
+        # Lựa chọn checkpoint tốt nhất
+        # --------------------------------------------------
 
-        is_better = (
-            metrics["f1"] > best_f1
-            or (
-                abs(metrics["f1"] - best_f1) < 0.000001
-                and metrics["precision"] > best_precision
+        if args.high_precision_mode:
+            # Ưu tiên Precision cao nhất (ít FP nhất)
+            # Nếu Precision bằng nhau, chọn F1 cao hơn
+            current_score = metrics["precision"]
+            is_better = (
+                current_score > best_score
+                or (
+                    abs(current_score - best_score) < 0.000001
+                    and metrics["f1"] > best_f1
+                )
             )
-        )
+        else:
+            # Ưu tiên F1 (cân bằng Precision-Recall)
+            # Nếu F1 bằng nhau, chọn Precision cao hơn (ít FP hơn)
+            current_score = metrics["f1"]
+            is_better = (
+                current_score > best_score
+                or (
+                    abs(current_score - best_score) < 0.000001
+                    and metrics["precision"] > best_precision
+                )
+            )
 
         if is_better:
 
+            best_score = current_score
             best_f1 = metrics["f1"]
-
             best_precision = metrics["precision"]
+            best_fp = metrics["fp"]
 
             best_checkpoint = {
                 "state_dict": deepcopy(model.state_dict()),
@@ -821,13 +1107,24 @@ def main():
 
                 "validation_f1_phone": metrics["f1"],
 
-                "validation_threshold": SELECTION_THRESHOLD,
+                "validation_fp": metrics["fp"],
+
+                "validation_threshold": selection_threshold,
 
                 "class_counts": train_counts,
 
                 "validation_class_counts": val_counts,
 
-                "epoch": epoch
+                "epoch": epoch,
+
+                # Lưu cấu hình training để tái hiện
+                "training_config": {
+                    "label_smoothing": args.label_smoothing,
+                    "mixup_alpha": args.mixup_alpha,
+                    "hard_negative_weight": args.hard_negative_weight,
+                    "freeze_backbone": args.freeze_backbone,
+                    "high_precision_mode": args.high_precision_mode,
+                }
             }
 
             torch.save(
@@ -835,8 +1132,11 @@ def main():
                 output_path
             )
 
+            mode_label = "Precision" if args.high_precision_mode else "F1"
             print(
-                f"  [SAVED] Best V2 checkpoint: {output_path}"
+                f"  [SAVED] Best checkpoint (epoch {epoch}): "
+                f"{mode_label}={current_score * 100:.2f}% | "
+                f"FP={metrics['fp']} -> {output_path}"
             )
 
     # ------------------------------------------------------
@@ -848,9 +1148,9 @@ def main():
             "Training không tạo được checkpoint."
         )
 
-    print("\n" + "=" * 65)
-    print("             V2 VALIDATION REPORT")
-    print("=" * 65)
+    print("\n" + "=" * 70)
+    print("                  VALIDATION REPORT")
+    print("=" * 70)
 
     print(
         "Best epoch:",
@@ -858,11 +1158,22 @@ def main():
     )
 
     print(
-        "Best validation F1 PHONE:",
+        "Best val F1 PHONE:",
         f"{best_checkpoint['validation_f1_phone'] * 100:.2f}%"
     )
 
-    print("\nTHRESHOLD COMPARISON")
+    print(
+        "Best val Precision PHONE:",
+        f"{best_checkpoint['validation_precision_phone'] * 100:.2f}%"
+    )
+
+    print(
+        "Best val FP (false positive):",
+        best_checkpoint["validation_fp"]
+    )
+
+    print("\nTHRESHOLD COMPARISON (best checkpoint)")
+    print("-" * 70)
 
     # Re-evaluate using the best saved model.
 
@@ -873,10 +1184,12 @@ def main():
     _, true_labels, phone_probs = validate(
         model,
         val_loader,
-        criterion,
         device,
         phone_index
     )
+
+    best_precision_threshold = 0.50
+    best_precision_val = 0.0
 
     for threshold in THRESHOLDS_TO_REPORT:
 
@@ -892,20 +1205,57 @@ def main():
             threshold
         )
 
-    print("\n" + "=" * 65)
+        # Tìm threshold cho Precision tốt nhất với Recall >= 0.5
+        if (
+            metrics["precision"] > best_precision_val
+            and metrics["recall"] >= 0.50
+        ):
+            best_precision_val = metrics["precision"]
+            best_precision_threshold = threshold
+
+    print("\n" + "=" * 70)
     print("TRAINING COMPLETED")
-    print("=" * 65)
+    print("=" * 70)
 
     print("Checkpoint:", output_path.resolve())
 
     print(
-        "Best validation F1 PHONE:",
+        "Best val F1 PHONE:",
         f"{best_f1 * 100:.2f}%"
     )
 
     print(
+        "Best val Precision PHONE:",
+        f"{best_precision * 100:.2f}%"
+    )
+
+    print(
+        "Best val FP (báo nhầm trên validation):",
+        best_fp
+    )
+
+    print(
         "Selection threshold:",
-        SELECTION_THRESHOLD
+        selection_threshold
+    )
+
+    print()
+    print(
+        f"💡 GỢI Ý: Nếu vẫn còn báo nhầm chuột/chai nước/bóp trong thực tế:"
+    )
+    print(
+        f"   1. Thêm nhiều ảnh chuột/chai nước/bóp vào NOT_PHONE, train lại."
+    )
+    print(
+        f"   2. Tăng threshold trong app.py hoặc phone_detector.py lên "
+        f"{best_precision_threshold:.2f} (threshold tốt nhất trên validation)."
+    )
+    print(
+        f"   3. Dùng --high-precision-mode để chọn checkpoint ưu tiên Precision."
+    )
+    print(
+        f"   4. Tăng --hard-negative-weight (hiện tại {args.hard_negative_weight}) "
+        f"để phạt FP nặng hơn."
     )
 
     print(

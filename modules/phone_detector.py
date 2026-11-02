@@ -12,6 +12,20 @@ class PhoneDetector:
     classifier is unavailable, candidates are rejected rather than treated as
     confirmed phones.
 
+    Pipeline:
+        1. YOLO đề xuất bounding box với class 67 (cell phone).
+        2. Bộ lọc hình học (aspect ratio + diện tích tối thiểu) loại bỏ bình
+           nước, chuột, bóp ví ngay lập tức — không cần CNN.
+        3. CNN xác minh từng ứng viên còn lại.
+
+    Điện thoại có tỉ lệ w/h đặc trưng:
+        - Portrait  : w/h ≈ 0.40 – 0.65
+        - Landscape : w/h ≈ 1.55 – 2.50
+    Vật bị nhầm thường ngoài vùng này:
+        - Bình nước : w/h ≈ 0.15 – 0.35  (bị lọc)
+        - Chuột     : w/h ≈ 0.65 – 1.10  (bị lọc)
+        - Bóp ví    : w/h ≈ 1.10 – 1.55  (bị lọc)
+
     Detection tuple format:
         (x1, y1, x2, y2, confidence)
 
@@ -21,13 +35,28 @@ class PhoneDetector:
 
     PHONE_CLASS_ID = 67
 
+    # Khoảng tỉ lệ w/h hợp lệ cho điện thoại.
+    # Portrait: 0.40–0.65 | Landscape: 1.55–2.50
+    # Dải (0.40, 2.50) bao phủ cả hai chiều giữ nguyên.
+    _ASPECT_MIN = 0.40
+    _ASPECT_MAX = 2.50
+
+    # Dải bị cấm giữa portrait và landscape (0.65–1.55):
+    # điện thoại gần vuông không tồn tại — đây thường là chuột hoặc bóp.
+    _ASPECT_FORBIDDEN_LOW  = 0.65
+    _ASPECT_FORBIDDEN_HIGH = 1.55
+
+    # Diện tích bounding box tối thiểu (pixel²).
+    # Loại bỏ những box quá nhỏ không thể là điện thoại thật.
+    _MIN_BOX_AREA = 1500
+
     def __init__(
         self,
         model_path: Optional[str] = None,
         confidence: float = 0.25,
         model=None,
         classifier_path: Optional[str] = None,
-        classifier_threshold: float = 0.50,
+        classifier_threshold: float = 0.65,  # tăng từ 0.50 → 0.65 để giảm FP
         classifier=None,
         use_classifier_if_available: bool = True,
     ) -> None:
@@ -163,6 +192,47 @@ class PhoneDetector:
 
         return candidates
 
+    def _passes_geometry_filter(
+        self,
+        candidate: Tuple[int, int, int, int, float]
+    ) -> bool:
+        """Lọc ứng viên bằng hình học bounding box TRƯỚC khi đưa vào CNN.
+
+        Điện thoại có tỉ lệ w/h (aspect ratio) rất đặc trưng:
+            - Portrait  : 0.40 – 0.65  (cao hơn rộng)
+            - Landscape : 1.55 – 2.50  (rộng hơn cao)
+        Vùng 0.65 – 1.55 (gần vuông) KHÔNG phải điện thoại:
+            - Chuột máy tính : ~0.75 – 1.10
+            - Bóp/ví         : ~1.10 – 1.50
+        Bình nước có w/h < 0.40 (rất cao so với rộng).
+
+        Trả về True nếu ứng viên có thể là điện thoại, False nếu loại.
+        """
+        x1, y1, x2, y2, _ = candidate
+
+        box_w = int(x2) - int(x1)
+        box_h = int(y2) - int(y1)
+
+        # Loại box quá nhỏ
+        area = box_w * box_h
+        if area < self._MIN_BOX_AREA:
+            return False
+
+        if box_h == 0:
+            return False
+
+        aspect = box_w / box_h
+
+        # Loại nếu ngoài dải hợp lệ tổng thể
+        if aspect < self._ASPECT_MIN or aspect > self._ASPECT_MAX:
+            return False
+
+        # Loại vùng "gần vuông" — điện thoại không có tỉ lệ này
+        if self._ASPECT_FORBIDDEN_LOW <= aspect <= self._ASPECT_FORBIDDEN_HIGH:
+            return False
+
+        return True
+
     @staticmethod
     def _crop_candidate(
         frame,
@@ -230,6 +300,25 @@ class PhoneDetector:
         if not candidates:
             return []
 
+        # Bước 2: Lọc hình học — loại bình nước/chuột/bóp không cần CNN.
+        geo_passed = []
+        for candidate in candidates:
+            if self._passes_geometry_filter(candidate):
+                geo_passed.append(candidate)
+            else:
+                x1, y1, x2, y2, conf = candidate
+                w = x2 - x1
+                h = y2 - y1
+                ratio = w / h if h > 0 else 0
+                print(
+                    f"[FILTER] Loai ung vien YOLO (hinh hoc): "
+                    f"w={w} h={h} ratio={ratio:.2f} area={w*h} "
+                    f"yolo_conf={conf:.2f}"
+                )
+
+        if not geo_passed:
+            return []
+
         # A YOLO proposal alone is not reliable enough to report a phone.
         if not self.load_classifier():
 
@@ -245,10 +334,10 @@ class PhoneDetector:
 
             return []
 
-        # Bước 3: CNN xác minh từng ứng viên.
+        # Bước 3: CNN xác minh từng ứng viên còn lại (đã qua lọc hình học).
         confirmed = []
 
-        for candidate in candidates:
+        for candidate in geo_passed:
 
             crop = self._crop_candidate(
                 frame,
